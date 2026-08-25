@@ -5,10 +5,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from google import genai
 from pydantic import BaseModel
-from dotenv import load_dotenv  # <-- 1. Import load_dotenv
+from dotenv import load_dotenv
 
 # Load variables from the .env file automatically
-load_dotenv()  # <-- 2. Execute it before reading os.environ
+load_dotenv()
 
 # Initialize Gemini Client (Free Tier)
 AI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -21,9 +21,9 @@ app = FastAPI(
 
 # Initialize SQLite Database for audit trail
 def init_db():
-  conn = sqlite3.connect("revshield.db")
-  cursor = conn.cursor()
-  cursor.execute("""
+    conn = sqlite3.connect("revshield.db")
+    cursor = conn.cursor()
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS failed_transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             payment_id TEXT,
@@ -37,21 +37,18 @@ def init_db():
             created_at TEXT
         )
     """)
-  conn.commit()
-  conn.close()
-
+    conn.commit()
+    conn.close()
 
 init_db()
 
-
 class WebhookPayload(BaseModel):
-  event: str
-  payload: dict
-
+    event: str
+    payload: dict
 
 def diagnose_failure_with_ai(error_code: str, error_description: str) -> str:
-  """Uses Gemini Flash to analyze payment failure and decide classification."""
-  prompt = f"""
+    """Uses Gemini Flash to analyze payment failure and decide classification."""
+    prompt = f"""
     You are an expert fintech payment gateway recovery agent. 
     Analyze the following payment failure and classify it strictly as either "RECOVERABLE" or "PERMANENT".
     
@@ -64,144 +61,136 @@ def diagnose_failure_with_ai(error_code: str, error_description: str) -> str:
     
     Respond in format: [CLASSIFICATION] - [Short 1-sentence reason]
     """
-  try:
-    response = ai_client.models.generate_content(
-        model="gemini-3.6-flash", contents=prompt
-    )
-    return response.text.strip()
-  except Exception as e:
-    return (
-        f"PERMANENT - AI diagnosis failed due to error: {str(e)} (Defaulting to"
-        " safe block)"
-    )
-
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-3.6-flash", contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        return (
+            f"PERMANENT - AI diagnosis failed due to error: {str(e)} (Defaulting to safe block)"
+        )
 
 @app.post("/webhook/failure")
 async def receive_webhook(data: WebhookPayload):
-  if data.event != "payment.failed":
-    return {"status": "ignored", "message": "Event not handled"}
+    if data.event != "payment.failed":
+        return {"status": "ignored", "message": "Event not handled"}
 
-  payment_data = data.payload.get("payment", {}).get("entity", {})
+    # Flexible parsing: supports both standard nested webhook formats and direct flat payloads
+    payment_entity = data.payload.get("payment", {}).get("entity", {})
+    if not payment_entity:
+        payment_entity = data.payload
 
-  payment_id = payment_data.get("id", "pay_unknown")
-  amount = payment_data.get("amount", 0)
-  currency = payment_data.get("currency", "INR")
-  error_code = payment_data.get("error_code", "UNKNOWN_ERROR")
-  error_description = payment_data.get(
-      "error_description", "No description provided"
-  )
+    payment_id = payment_entity.get("id") or payment_entity.get("payment_id", "pay_unknown")
+    amount = payment_entity.get("amount", 0)
+    currency = payment_entity.get("currency", "INR")
+    error_code = payment_entity.get("error_code", "UNKNOWN_ERROR")
+    error_description = payment_entity.get("error_description", "No description provided")
 
-  # --- AI DIAGNOSIS STEP ---
-  ai_diagnosis = diagnose_failure_with_ai(error_code, error_description)
+    # --- AI DIAGNOSIS STEP ---
+    ai_diagnosis = diagnose_failure_with_ai(error_code, error_description)
 
-  # Determine action based on AI diagnosis (Guardrails)
-  if "RECOVERABLE" in ai_diagnosis.upper():
-    action_taken = (
-        "SCHEDULED_SMART_RETRY (Routed to backup test-mode gateway)"
+    # Determine action based on AI diagnosis (Guardrails)
+    if "RECOVERABLE" in ai_diagnosis.upper():
+        action_taken = "SCHEDULED_SMART_RETRY (Routed to backup test-mode gateway)"
+        final_status = "RECOVERY_IN_PROGRESS"
+    else:
+        action_taken = "BLOCKED_PERMANENT_FAILURE (No retry allowed)"
+        final_status = "DROPPED_SECURELY"
+
+    # Save to SQLite Database
+    conn = sqlite3.connect("revshield.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+            INSERT INTO failed_transactions (payment_id, amount, currency, error_code, error_description, status, diagnosis, action_taken, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payment_id,
+            amount,
+            currency,
+            error_code,
+            error_description,
+            final_status,
+            ai_diagnosis,
+            action_taken,
+            datetime.now().isoformat(),
+        ),
     )
-    final_status = "RECOVERY_IN_PROGRESS"
-  else:
-    action_taken = "BLOCKED_PERMANENT_FAILURE (No retry allowed)"
-    final_status = "DROPPED_SECURELY"
+    conn.commit()
+    conn.close()
 
-  # Save to SQLite Database
-  conn = sqlite3.connect("revshield.db")
-  cursor = conn.cursor()
-  cursor.execute(
-      """
-        INSERT INTO failed_transactions (payment_id, amount, currency, error_code, error_description, status, diagnosis, action_taken, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-      (
-          payment_id,
-          amount,
-          currency,
-          error_code,
-          error_description,
-          final_status,
-          ai_diagnosis,
-          action_taken,
-          datetime.now().isoformat(),
-      ),
-  )
-  conn.commit()
-  conn.close()
-
-  return {
-      "status": "success",
-      "payment_id": payment_id,
-      "ai_diagnosis": ai_diagnosis,
-      "action_taken": action_taken,
-  }
-
+    return {
+        "status": "success",
+        "payment_id": payment_id,
+        "ai_diagnosis": ai_diagnosis,
+        "action_taken": action_taken,
+    }
 
 @app.get("/audit-trail")
 async def get_audit_trail():
-  conn = sqlite3.connect("revshield.db")
-  conn.row_factory = sqlite3.Row
-  cursor = conn.cursor()
-  cursor.execute(
-      "SELECT * FROM failed_transactions ORDER BY id DESC LIMIT 20"
-  )
-  rows = cursor.fetchall()
-  conn.close()
-  return {"audit_trail": [dict(row) for row in rows]}
+    conn = sqlite3.connect("revshield.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM failed_transactions ORDER BY id DESC LIMIT 20")
+    rows = cursor.fetchall()
+    conn.close()
+    return {"audit_trail": [dict(row) for row in rows]}
 
-
-# --- NEW: Interactive Web Dashboard UI Route ---
+# --- Interactive Web Dashboard UI Route ---
 def get_dashboard_data():
-  conn = sqlite3.connect("revshield.db")
-  conn.row_factory = sqlite3.Row
-  cursor = conn.cursor()
+    conn = sqlite3.connect("revshield.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
 
-  cursor.execute("SELECT * FROM failed_transactions ORDER BY id DESC LIMIT 50")
-  rows = [dict(row) for row in cursor.fetchall()]
+    cursor.execute("SELECT * FROM failed_transactions ORDER BY id DESC LIMIT 50")
+    rows = [dict(row) for row in cursor.fetchall()]
 
-  # Compute summary metrics
-  cursor.execute(
-      "SELECT COUNT(*), SUM(amount), SUM(CASE WHEN status='RECOVERY_IN_PROGRESS' THEN 1 ELSE 0 END), SUM(CASE WHEN status='DROPPED_SECURELY' THEN 1 ELSE 0 END) FROM failed_transactions"
-  )
-  metrics = cursor.fetchone()
-  conn.close()
+    # Compute summary metrics
+    cursor.execute(
+        "SELECT COUNT(*), SUM(amount), SUM(CASE WHEN status='RECOVERY_IN_PROGRESS' THEN 1 ELSE 0 END), SUM(CASE WHEN status='DROPPED_SECURELY' THEN 1 ELSE 0 END) FROM failed_transactions"
+    )
+    metrics = cursor.fetchone()
+    conn.close()
 
-  total_tx = metrics[0] or 0
-  total_volume = metrics[1] or 0
-  recovered_count = metrics[2] or 0
-  dropped_count = metrics[3] or 0
+    total_tx = metrics[0] or 0
+    total_volume = metrics[1] or 0
+    recovered_count = metrics[2] or 0
+    dropped_count = metrics[3] or 0
 
-  success_rate = (
-      round((recovered_count / total_tx * 100), 1) if total_tx > 0 else 0.0
-  )
+    success_rate = (
+        round((recovered_count / total_tx * 100), 1) if total_tx > 0 else 0.0
+    )
 
-  return (
-      rows,
-      total_tx,
-      total_volume,
-      recovered_count,
-      dropped_count,
-      success_rate,
-  )
-
+    return (
+        rows,
+        total_tx,
+        total_volume,
+        recovered_count,
+        dropped_count,
+        success_rate,
+    )
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-  (
-      rows,
-      total_tx,
-      total_volume,
-      recovered_count,
-      dropped_count,
-      success_rate,
-  ) = get_dashboard_data()
+    (
+        rows,
+        total_tx,
+        total_volume,
+        recovered_count,
+        dropped_count,
+        success_rate,
+    ) = get_dashboard_data()
 
-  table_rows = ""
-  for r in rows:
-    status_color = (
-        "bg-blue-900 text-blue-200 border-blue-700"
-        if "RECOVERY" in r["status"]
-        else "bg-rose-900 text-rose-200 border-rose-700"
-    )
-    table_rows += f"""
+    table_rows = ""
+    for r in rows:
+        status_color = (
+            "bg-blue-900 text-blue-200 border-blue-700"
+            if "RECOVERY" in r["status"]
+            else "bg-rose-900 text-rose-200 border-rose-700"
+        )
+        table_rows += f"""
         <tr class="hover:bg-slate-700/50 transition">
             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-white">{r['payment_id']}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-300">₹{r['amount']:,.2f}</td>
@@ -212,7 +201,7 @@ def dashboard():
         </tr>
         """
 
-  html_content = f"""
+    html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -284,4 +273,4 @@ def dashboard():
     </body>
     </html>
     """
-  return html_content
+    return html_content
