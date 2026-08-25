@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local SQLite database (each user should generate their own fresh DB)
+revshield.db
+
+# Sensitive environment variables
+.env
